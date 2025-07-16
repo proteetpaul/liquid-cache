@@ -3,7 +3,7 @@ use std::fmt::{Debug, Formatter};
 use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
-use std::{fs::File, io::Write, path::PathBuf};
+use std::{io::Write, path::PathBuf};
 
 use super::{
     CacheEntryID, CachedBatch, LiquidCompressorStates,
@@ -262,10 +262,13 @@ impl CacheStore {
     }
 
     fn write_to_disk(&self, entry_id: &CacheEntryID, liquid_array: &LiquidArrayRef) {
-        let bytes = liquid_array.to_bytes();
+        let mut bytes = liquid_array.to_bytes();
         let file_path = entry_id.on_disk_path(self.config.cache_root_dir());
-        let mut file = File::create(file_path).unwrap();
-        file.write_all(&bytes).unwrap();
+        let mut file = std::fs::OpenOptions::new().create(true).write(true).truncate(true).custom_flags(libc::O_DIRECT).open(file_path).unwrap();
+        const ALIGNMENT: usize = 4096;
+        let aligned_len = (bytes.len() + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT;
+        let slice = unsafe {std::slice::from_raw_parts_mut(bytes.as_mut_ptr(), aligned_len)};
+        file.write_all(slice).unwrap();
         self.budget.add_used_disk_bytes(bytes.len());
     }
 
