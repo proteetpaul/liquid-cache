@@ -27,6 +27,7 @@ tempfile = { workspace = true }
 congee = { workspace = true }
 log = { workspace = true }
 parquet = { workspace = true }
+crossbeam-channel = "0.5.15"
 
 
 [target.'cfg(target_os = "linux")'.dependencies]

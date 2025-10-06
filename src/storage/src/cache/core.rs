@@ -601,12 +601,22 @@ impl CacheStorage {
         }
         #[cfg(target_os = "linux")]
         {
-            let mut file = super::io::File::create(&path)
-                .await
+            use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt as _};
+            use std::os::fd::AsRawFd;
+            use crate::cache::new_io::FileWriteTask;
+
+            let file = OpenOptions::new().create(true).write(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(path)
                 .expect("failed to create file");
-            file.write_all(bytes)
-                .await
-                .expect("failed to write to file");
+            let task = Arc::new(
+                FileWriteTask::new(
+                    bytes.as_ptr(), bytes.len(), file.as_raw_fd()
+                )
+            );
+            // UringFuture will be responsible for submitting and driving the future to completion
+            let uring_fut = super::new_io::UringFuture::new(task);
+            uring_fut.await;
         }
         let disk_usage = bytes.len();
         self.budget.add_used_disk_bytes(disk_usage);
