@@ -120,6 +120,7 @@ impl From<ParquetArrayID> for ColumnAccessPath {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn blocking_reading_io(request: &IoRequest) -> Result<Bytes, std::io::Error> {
     let path = &request.path();
     let mut file = File::open(path)?;
@@ -145,7 +146,7 @@ pub(crate) async fn non_blocking_reading_io(request: &IoRequest) -> Result<Bytes
     use super::super::storage::cache::new_io::{FileReadTask, UringFuture};
 
     let path = &request.path();
-    let file = OpenOptions::new().create(true).write(true)
+    let file = OpenOptions::new().read(true)
                 .custom_flags(libc::O_DIRECT)
                 .open(path)
                 .expect("failed to create file");

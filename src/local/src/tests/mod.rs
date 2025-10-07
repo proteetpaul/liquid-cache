@@ -97,7 +97,7 @@ async fn test_runner(sql: &str, reference: &str, cache_dir: &Path) {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_url_prefix_filtering() {
     let cache_dir = TempDir::new().unwrap();
     let sql = r#"select COUNT(*) from hits where "URL" like 'https://%'"#;
@@ -114,7 +114,7 @@ async fn test_url_prefix_filtering() {
     test_runner(sql, &reference, cache_dir.path()).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_url_selection_and_ordering() {
     let cache_dir = TempDir::new().unwrap();
     let sql = r#"select "URL" from hits where "URL" like '%tours%' order by "URL" desc"#;
@@ -131,7 +131,7 @@ async fn test_url_selection_and_ordering() {
     test_runner(sql, &reference, cache_dir.path()).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_os_selection() {
     let cache_dir = TempDir::new().unwrap();
     let sql = r#"select "OS" from hits where "URL" like '%tours%' order by "OS" desc"#;
@@ -149,7 +149,7 @@ async fn test_os_selection() {
     test_runner(sql, &reference, cache_dir.path()).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_referer_filtering() {
     let cache_dir = TempDir::new().unwrap();
     let sql = r#"select "Referer" from hits where "Referer" <> '' AND "URL" like '%tours%' order by "Referer" desc"#;
@@ -167,7 +167,7 @@ async fn test_referer_filtering() {
     test_runner(sql, &reference, cache_dir.path()).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_single_column_filter_projection() {
     let cache_dir = TempDir::new().unwrap();
     let sql = r#"select "WatchID" from hits where "WatchID" = 6978470580070504163"#;
@@ -185,7 +185,7 @@ async fn test_single_column_filter_projection() {
     test_runner(sql, &reference, cache_dir.path()).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_provide_schema_with_filter() {
     let cache_dir = TempDir::new().unwrap();
     let sql = r#"select "WatchID", "OS", "EventTime" from hits where "OS" <> 2 order by "WatchID" desc limit 10"#;

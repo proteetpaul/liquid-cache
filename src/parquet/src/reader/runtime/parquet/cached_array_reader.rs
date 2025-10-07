@@ -127,7 +127,7 @@ impl CachedArrayReader {
         Ok(to_skip)
     }
 
-    fn consume_batch_inner(&mut self) -> Result<ArrayRef, ParquetError> {
+    async fn consume_batch_inner(&mut self) -> Result<ArrayRef, ParquetError> {
         let batch_size = self.batch_size();
         let mut selection_builder = std::mem::replace(
             &mut self.selection_buffer,
@@ -172,7 +172,7 @@ impl CachedArrayReader {
             // Get cached array and apply filter
             let array = match self
                 .liquid_cache
-                .get_arrow_array_with_filter(batch_id, &mask)
+                .get_arrow_array_with_filter(batch_id, &mask).await
             {
                 Some(array) => array,
                 None => {
@@ -229,7 +229,13 @@ impl ArrayReader for CachedArrayReader {
     }
 
     fn consume_batch(&mut self) -> Result<ArrayRef, ParquetError> {
-        let array = self.consume_batch_inner()?;
+        let array = tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::current();
+            handle.block_on(async {
+                self.consume_batch_inner().await.unwrap()
+            })
+        });
+                
         debug_assert_eq!(&self.data_type, array.data_type());
         Ok(array)
     }
@@ -482,8 +488,8 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn test_read_at_batch_boundary() {
+    #[tokio::test]
+    async fn test_read_at_batch_boundary() {
         let (mut reader, cache) = set_up_reader();
 
         // Read and consume
@@ -493,6 +499,7 @@ mod tests {
             let expected = reader.consume_batch().unwrap();
             let actual = cache
                 .get_arrow_array_test_only(BatchID::from_row_id(i, BATCH_SIZE))
+                .await
                 .unwrap();
             assert_eq!(&expected, &actual);
             let cache_expected = get_expected_cached_value(i);
@@ -512,6 +519,7 @@ mod tests {
         for i in (0..96).step_by(32) {
             let array = cache
                 .get_arrow_array_test_only(BatchID::from_row_id(i, BATCH_SIZE))
+                .await
                 .unwrap();
             let expected = get_expected_cached_value(i);
             assert_eq!(&array, &expected);
@@ -534,9 +542,9 @@ mod tests {
         reader.read_records(32).unwrap();
         let expected = reader.consume_batch().unwrap();
         assert_eq!(expected.len(), 64);
-        assert_contains(&cache, 0);
-        assert_not_contains(&cache, 32);
-        assert_contains(&cache, 64);
+        assert_contains(&cache, 0).await;
+        assert_not_contains(&cache, 32).await;
+        assert_contains(&cache, 64).await;
     }
 
     #[test]
@@ -545,72 +553,72 @@ mod tests {
         reader.consume_batch().unwrap();
     }
 
-    #[test]
-    fn test_large_skip_and_read() {
+    #[tokio::test]
+    async fn test_large_skip_and_read() {
         {
             let (mut reader, cache) = set_up_reader();
             reader.read_records(90).unwrap();
             let array = reader.consume_batch().unwrap();
             assert_eq!(array.len(), 90);
-            assert_contains(&cache, 0);
-            assert_contains(&cache, 32);
-            assert_contains(&cache, 64);
+            assert_contains(&cache, 0).await;
+            assert_contains(&cache, 32).await;
+            assert_contains(&cache, 64).await;
         }
         {
             let (mut reader, cache) = set_up_reader();
             reader.skip_records(40).unwrap();
             let array = reader.consume_batch().unwrap();
             assert_eq!(array.len(), 0);
-            assert_not_contains(&cache, 0);
+            assert_not_contains(&cache, 0).await;
 
             reader.read_records(40).unwrap();
-            assert_contains(&cache, 32);
+            assert_contains(&cache, 32).await;
 
-            assert_contains(&cache, 64);
+            assert_contains(&cache, 64).await;
             let array = reader.consume_batch().unwrap();
             assert_eq!(array.len(), 40);
         }
     }
 
-    #[test]
-    fn test_skip_partial() {
+    #[tokio::test]
+    async fn test_skip_partial() {
         let (mut reader, cache) = set_up_reader();
         reader.read_records(20).unwrap();
         reader.skip_records(20).unwrap();
         reader.read_records(20).unwrap();
 
-        assert_contains(&cache, 0);
-        assert_contains(&cache, 32);
+        assert_contains(&cache, 0).await;
+        assert_contains(&cache, 32).await;
     }
 
-    #[test]
-    fn test_read_partial_batch() {
+    #[tokio::test]
+    async fn test_read_partial_batch() {
         let (mut reader, cache) = set_up_reader();
 
         {
             reader.read_records(20).unwrap();
-            assert_contains(&cache, 0);
+            assert_contains(&cache, 0).await;
             let read_array = reader.consume_batch().unwrap();
             assert_eq!(read_array.len(), 20);
         }
 
         {
             reader.read_records(20).unwrap();
-            assert_contains(&cache, 32);
+            assert_contains(&cache, 32).await;
             let read_array = reader.consume_batch().unwrap();
             assert_eq!(read_array.len(), 20);
         }
 
         {
             reader.read_records(32).unwrap();
-            assert_contains(&cache, 64);
+            assert_contains(&cache, 64).await;
             let read_array = reader.consume_batch().unwrap();
             assert_eq!(read_array.len(), 32);
         }
     }
 
-    #[test]
-    fn test_read_with_all_cached() {
+    #[tokio::test]
+    async fn test_read_with_all_cached() {
         let (mut reader, cache) = set_up_reader();
         reader.read_records(96).unwrap();
         let array = reader.consume_batch().unwrap();
@@ -618,7 +626,7 @@ mod tests {
         assert_eq!(reader.inner().read_cnt, 3);
         assert_eq!(reader.inner().skip_cnt, 0);
         for id in [0, 32, 64] {
-            assert_contains(&cache, id);
+            assert_contains(&cache, id).await;
         }
 
         let mut reader = set_up_reader_with_cache(cache.clone());
@@ -628,7 +636,7 @@ mod tests {
         assert_eq!(reader.inner().read_cnt, 0);
         assert_eq!(reader.inner().skip_cnt, 0);
         for id in [0, 32, 64] {
-            assert_contains(&cache, id);
+            assert_contains(&cache, id).await;
         }
 
         let mut reader = set_up_reader_with_cache(cache.clone());
@@ -641,39 +649,39 @@ mod tests {
         assert_eq!(array.len(), 40);
     }
 
-    fn assert_contains(cache: &LiquidCachedColumnRef, id: usize) {
+    async fn assert_contains(cache: &LiquidCachedColumnRef, id: usize) {
         let actual = cache
             .get_arrow_array_test_only(BatchID::from_row_id(id, BATCH_SIZE))
-            .unwrap();
+            .await.unwrap();
         let expected = get_expected_cached_value(id);
         assert_eq!(&actual, &expected);
     }
 
-    fn assert_not_contains(cache: &LiquidCachedColumnRef, id: usize) {
+    async fn assert_not_contains(cache: &LiquidCachedColumnRef, id: usize) {
         assert!(
             cache
                 .get_arrow_array_test_only(BatchID::from_row_id(id, BATCH_SIZE))
-                .is_none()
+                .await.is_none()
         );
     }
 
-    #[test]
-    fn test_read_with_partial_cached() {
-        fn get_warm_cache() -> LiquidCachedColumnRef {
+    #[tokio::test]
+    async fn test_read_with_partial_cached() {
+        async fn get_warm_cache() -> LiquidCachedColumnRef {
             let (mut reader, cache) = set_up_reader();
             reader.read_records(32).unwrap();
             reader.skip_records(32).unwrap();
             reader.read_records(32).unwrap();
             let array = reader.consume_batch().unwrap();
             assert_eq!(array.len(), 64);
-            assert_contains(&cache, 0);
-            assert_not_contains(&cache, 32);
+            assert_contains(&cache, 0).await;
+            assert_not_contains(&cache, 32).await;
             assert_eq!(reader.inner().read_cnt, 2);
             assert_eq!(reader.inner().skip_cnt, 1);
             cache
         }
 
-        let cache = get_warm_cache();
+        let cache = get_warm_cache().await;
         let mut reader = set_up_reader_with_cache(cache.clone());
         reader.read_records(96).unwrap();
         let array = reader.consume_batch().unwrap();
@@ -681,10 +689,10 @@ mod tests {
         assert_eq!(reader.inner().read_cnt, 1);
         assert_eq!(reader.inner().skip_cnt, 1);
         for id in [0, 32, 64] {
-            assert_contains(&cache, id);
+            assert_contains(&cache, id).await;
         }
 
-        let cache = get_warm_cache();
+        let cache = get_warm_cache().await;
         let mut reader = set_up_reader_with_cache(cache.clone());
         reader.read_records(16).unwrap();
         reader.skip_records(48).unwrap();
@@ -694,9 +702,9 @@ mod tests {
         assert_eq!(array.len(), 32);
         assert_eq!(reader.inner().read_cnt, 0);
         assert_eq!(reader.inner().skip_cnt, 0);
-        assert_contains(&cache, 0);
-        assert_not_contains(&cache, 32);
-        assert_contains(&cache, 64);
+        assert_contains(&cache, 0).await;
+        assert_not_contains(&cache, 32).await;
+        assert_contains(&cache, 64).await;
     }
 
     #[tokio::test]
@@ -721,7 +729,7 @@ mod tests {
         assert_eq!(reader.current_row, 40);
         assert_eq!(reader.next_batch_to_check_cached, 2);
 
-        reader.consume_batch_inner().unwrap();
+        reader.consume_batch_inner().await.unwrap();
 
         reader.read_records_inner(10).await.unwrap();
         assert_eq!(

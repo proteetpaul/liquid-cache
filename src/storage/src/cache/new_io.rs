@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use std::{ops::Range, os::fd::RawFd, pin::Pin, sync::{atomic::{AtomicBool, Ordering}, Arc, LazyLock, Mutex}, task::{Context, Poll, Waker}, thread};
 
 use io_uring::{cqueue, opcode, squeue, IoUring};
@@ -53,10 +54,17 @@ impl IoTask for FileReadTask {
     
     #[inline]
     fn get_sqe(&self, user_data: u64) -> squeue::Entry {
+        let num_bytes = self.range.end - self.range.start;
+        let padding = if num_bytes % 4096 == 0 {
+            0
+        } else {
+            4096 - num_bytes % 4096
+        };
+        let num_bytes_aligned = num_bytes + padding;
         let read_op = opcode::Read::new(
             io_uring::types::Fd(self.fd),
             self.base_ptr,
-            (self.range.end - self.range.start) as u32, // Logically, this should be the remaining number of bytes, but that fails...
+            num_bytes_aligned as u32, // Logically, this should be the remaining number of bytes, but that fails...
         );
         let sqe = read_op
             .offset(self.range.start)
