@@ -1,4 +1,4 @@
-use std::{os::fd::RawFd, pin::Pin, sync::{atomic::{AtomicBool, Ordering}, Arc, LazyLock, Mutex}, task::{Context, Poll, Waker}, thread};
+use std::{ops::Range, os::fd::RawFd, pin::Pin, sync::{atomic::{AtomicBool, Ordering}, Arc, LazyLock, Mutex}, task::{Context, Poll, Waker}, thread};
 
 use io_uring::{cqueue, opcode, squeue, IoUring};
 
@@ -27,16 +27,21 @@ pub trait IoTask: Send + Sync {
 #[allow(unused)]
 pub struct FileReadTask {
     base_ptr: *mut u8,
-    num_bytes: usize,
     fd: RawFd,
     completed: AtomicBool,
     waker: Mutex<Option<Waker>>,
+    range: Range<u64>,
 }
 
 impl FileReadTask {
     #[allow(unused)]
-    pub(crate) fn new(base_ptr: *mut u8, num_bytes: usize, fd: RawFd) -> FileReadTask {
-        return FileReadTask {base_ptr, num_bytes, fd, completed: AtomicBool::new(false), waker: Mutex::<Option<Waker>>::new(None)}
+    pub fn new(base_ptr: *mut u8, range: Range<u64>, fd: RawFd) -> FileReadTask {
+        return FileReadTask {base_ptr, fd, completed: AtomicBool::new(false), waker: Mutex::<Option<Waker>>::new(None), range: range}
+    }
+
+    #[inline]
+    pub fn ptr(&self) -> *const u8 {
+        self.base_ptr as *const u8
     }
 }
 
@@ -51,10 +56,10 @@ impl IoTask for FileReadTask {
         let read_op = opcode::Read::new(
             io_uring::types::Fd(self.fd),
             self.base_ptr,
-            self.num_bytes as u32, // Logically, this should be the remaining number of bytes, but that fails...
+            (self.range.end - self.range.start) as u32, // Logically, this should be the remaining number of bytes, but that fails...
         );
         let sqe = read_op
-            .offset(0u64)
+            .offset(self.range.start)
             .build()
             .user_data(user_data as u64);
         sqe

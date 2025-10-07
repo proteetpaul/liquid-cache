@@ -215,7 +215,7 @@ mod tests {
                         memory_size_sum += array.get_array_memory_size();
 
                         if batch.is_multiple_of(2) {
-                            _ = column.get_arrow_array_test_only(batch_id).unwrap();
+                            _ = column.get_arrow_array_test_only(batch_id).await.unwrap();
                         }
                     }
                 }
