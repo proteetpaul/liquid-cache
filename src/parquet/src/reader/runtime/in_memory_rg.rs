@@ -543,8 +543,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_get_missing_batch_ranges() {
+    #[tokio::test]
+    async fn test_get_missing_batch_ranges() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let batch_size = 32;
         let liquid_cache = LiquidCache::new(
@@ -575,10 +575,10 @@ mod tests {
         let array_data = Arc::new(Int32Array::from((0..32).collect::<Vec<i32>>()));
         column
             .insert(BatchID::from_row_id(0, batch_size), array_data.clone())
-            .unwrap();
+            .await.unwrap();
         column
             .insert(BatchID::from_row_id(64, batch_size), array_data.clone())
-            .unwrap();
+            .await.unwrap();
 
         let missing_ranges = get_missing_batch_ranges(100, 0, &liquid_cache_rg);
         // Should be missing batch 1 (rows 32-63) and batch 3 (rows 96-99)
@@ -587,10 +587,10 @@ mod tests {
         // Test Case 4: Cache all batches
         column
             .insert(BatchID::from_row_id(32, batch_size), array_data.clone())
-            .unwrap();
+            .await.unwrap();
         column
             .insert(BatchID::from_row_id(96, batch_size), array_data.clone())
-            .unwrap();
+            .await.unwrap();
 
         let missing_ranges = get_missing_batch_ranges(100, 0, &liquid_cache_rg);
         // Should have no missing ranges
@@ -617,6 +617,7 @@ mod tests {
         // Cache only the middle batch
         column2
             .insert(BatchID::from_row_id(32, batch_size), array_data.clone())
+            .await
             .unwrap();
 
         let missing_ranges = get_missing_batch_ranges(100, 1, &liquid_cache_rg);
@@ -840,7 +841,7 @@ mod tests {
             let batch_id = BatchID::from_row_id(i, batch_size);
             let array = baseline_results[i / batch_size].clone();
             let inner_array = array.as_struct().column(0).clone();
-            column.insert(batch_id, inner_array).unwrap();
+            column.insert(batch_id, inner_array).await.unwrap();
         }
         let mut row_group =
             InMemoryRowGroup::new(row_group_metadata, None, None, liquid_cache_rg.clone());

@@ -121,7 +121,7 @@ impl LiquidCachedColumn {
     }
 
     /// Insert an array into the cache.
-    pub fn insert(
+    pub async fn insert(
         self: &Arc<Self>,
         batch_id: BatchID,
         array: ArrayRef,
@@ -130,7 +130,7 @@ impl LiquidCachedColumn {
             return Err(InsertArrowArrayError::AlreadyCached);
         }
         self.cache_store
-            .insert(self.entry_id(batch_id).into(), array);
+            .insert(self.entry_id(batch_id).into(), array).await;
         Ok(())
     }
 }
@@ -461,8 +461,8 @@ mod tests {
         file.row_group(0)
     }
 
-    #[test]
-    fn evaluate_or_on_cached_columns() {
+    #[tokio::test]
+    async fn evaluate_or_on_cached_columns() {
         let batch_size = 4;
         let row_group = setup_cache(batch_size);
 
@@ -479,8 +479,8 @@ mod tests {
         let array_a = Arc::new(Int32Array::from(vec![1, 2, 3, 4]));
         let array_b = Arc::new(Int32Array::from(vec![10, 20, 30, 40]));
 
-        assert!(col_a.insert(batch_id, array_a.clone()).is_ok());
-        assert!(col_b.insert(batch_id, array_b.clone()).is_ok());
+        assert!(col_a.insert(batch_id, array_a.clone()).await.is_ok());
+        assert!(col_b.insert(batch_id, array_b.clone()).await.is_ok());
 
         // build parquet metadata for predicate construction
         let tmp_meta = tempfile::NamedTempFile::new().unwrap();
@@ -526,8 +526,8 @@ mod tests {
         assert_eq!(result, expected);
     }
 
-    #[test]
-    fn evaluate_three_column_or() {
+    #[tokio::test]
+    async fn evaluate_three_column_or() {
         let batch_size = 8;
         let row_group = setup_cache(batch_size);
 
@@ -549,9 +549,9 @@ mod tests {
             100, 200, 300, 400, 500, 600, 700, 800,
         ]));
 
-        assert!(col_a.insert(batch_id, array_a.clone()).is_ok());
-        assert!(col_b.insert(batch_id, array_b.clone()).is_ok());
-        assert!(col_c.insert(batch_id, array_c.clone()).is_ok());
+        assert!(col_a.insert(batch_id, array_a.clone()).await.is_ok());
+        assert!(col_b.insert(batch_id, array_b.clone()).await.is_ok());
+        assert!(col_c.insert(batch_id, array_c.clone()).await.is_ok());
 
         // build parquet metadata for predicate construction
         let tmp_meta = tempfile::NamedTempFile::new().unwrap();
@@ -608,8 +608,8 @@ mod tests {
         assert_eq!(result, expected);
     }
 
-    #[test]
-    fn evaluate_string_column_or() {
+    #[tokio::test]
+    async fn evaluate_string_column_or() {
         let batch_size = 8;
         let row_group = setup_cache(batch_size);
 
@@ -632,8 +632,8 @@ mod tests {
             "New York", "London", "Paris", "Tokyo", "Berlin", "Sydney", "Madrid", "Rome",
         ]));
 
-        assert!(col_name.insert(batch_id, array_name.clone()).is_ok());
-        assert!(col_city.insert(batch_id, array_city.clone()).is_ok());
+        assert!(col_name.insert(batch_id, array_name.clone()).await.is_ok());
+        assert!(col_city.insert(batch_id, array_city.clone()).await.is_ok());
 
         // build parquet metadata for predicate construction
         let tmp_meta = tempfile::NamedTempFile::new().unwrap();

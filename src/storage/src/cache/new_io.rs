@@ -2,8 +2,6 @@ use std::{os::fd::RawFd, pin::Pin, sync::{atomic::{AtomicBool, Ordering}, Arc, L
 
 use io_uring::{cqueue, opcode, squeue, IoUring};
 
-pub const BUFFER_ALIGNMENT: usize = 4096;
-
 pub trait IoTask: Send + Sync {
     #[inline]
     fn set_waker(self: &Self, waker: Waker) {
@@ -36,6 +34,7 @@ pub struct FileReadTask {
 }
 
 impl FileReadTask {
+    #[allow(unused)]
     pub(crate) fn new(base_ptr: *mut u8, num_bytes: usize, fd: RawFd) -> FileReadTask {
         return FileReadTask {base_ptr, num_bytes, fd, completed: AtomicBool::new(false), waker: Mutex::<Option<Waker>>::new(None)}
     }
@@ -215,7 +214,7 @@ impl UringWorker {
                     sq.sync();
                     self.submitted_tasks[self.op_counter as usize] = Some(task);
                     self.completions_array[self.op_counter as usize] = 1;
-                    self.op_counter = self.op_counter.wrapping_add(1);
+                    self.op_counter = (self.op_counter + 1) & 63;
                 }
                 self.ring.submit().expect("Failed to submit");
                 

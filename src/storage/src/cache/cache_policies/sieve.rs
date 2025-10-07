@@ -259,8 +259,8 @@ mod tests {
         assert_eq!(state.total_size, 3);
     }
 
-    #[test]
-    fn test_sieve_integration() {
+    #[tokio::test]
+    async fn test_sieve_integration() {
         let advisor = SievePolicy::new(None);
         let store = create_cache_store(3000, Box::new(advisor));
 
@@ -268,9 +268,9 @@ mod tests {
         let entry_id2 = EntryID::from(2);
         let entry_id3 = EntryID::from(3);
 
-        store.insert(entry_id1, create_test_arrow_array(100));
-        store.insert(entry_id2, create_test_arrow_array(100));
-        store.insert(entry_id3, create_test_arrow_array(100));
+        store.insert(entry_id1, create_test_arrow_array(100)).await;
+        store.insert(entry_id2, create_test_arrow_array(100)).await;
+        store.insert(entry_id3, create_test_arrow_array(100)).await;
 
         assert!(store.get(&entry_id1).is_some());
         assert!(store.get(&entry_id2).is_some());
