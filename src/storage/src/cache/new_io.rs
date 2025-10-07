@@ -5,6 +5,7 @@ use io_uring::{cqueue, opcode, squeue, IoUring};
 pub const BUFFER_ALIGNMENT: usize = 4096;
 
 pub trait IoTask: Send + Sync {
+    #[inline]
     fn set_waker(self: &Self, waker: Waker) {
         let mut guard = self.waker().lock().unwrap();
         *guard = Some(waker);
@@ -25,6 +26,7 @@ pub trait IoTask: Send + Sync {
     }
 }
 
+#[allow(unused)]
 pub struct FileReadTask {
     base_ptr: *mut u8,
     num_bytes: usize,
@@ -84,22 +86,22 @@ impl FileWriteTask {
 
 impl IoTask for FileWriteTask {
     #[inline]
-    fn set_waker(self: &Self, waker: Waker) {
-        let mut guard = self.waker.lock().unwrap();
-        *guard = Some(waker);
-    }
-
-    #[inline]
     fn waker(self: &Self) -> &Mutex<Option<Waker>> {
         return &self.waker;
     }
     
     #[inline]
     fn get_sqe(&self, user_data: u64) -> squeue::Entry {
+        let padding = if self.num_bytes % 4096 == 0 {
+            0
+        } else {
+            4096 - self.num_bytes % 4096
+        };
+        let num_bytes_aligned = self.num_bytes + padding;
         let write_op = opcode::Write::new(
             io_uring::types::Fd(self.fd),
             self.base_ptr,
-            self.num_bytes as u32,
+            num_bytes_aligned as u32,
         );
 
         let sqe = write_op
@@ -198,24 +200,26 @@ impl UringWorker {
             }
             
             while self.inflight_requests < IoUringThreadpool::NUM_ENTRIES {
-                // Consume tasks from channel and submit them to the ring
-                let sq = &mut (self.ring.submission());
-
                 let res = self.channel.try_recv();
                 if res.is_err() {break;}
                 let task = res.unwrap();
-                let sqe = task.get_sqe((self.op_counter as u64)<<48);
-                
-                unsafe {
-                    sq.push(&sqe)
-                        .expect("Failed to push to submission queue");
+                // Consume tasks from channel and submit them to the ring
+                {
+                    let sq = &mut (self.ring.submission());
+                    let sqe = task.get_sqe((self.op_counter as u64)<<48);
+                    
+                    unsafe {
+                        sq.push(&sqe)
+                            .expect("Failed to push to submission queue");
+                    }
+                    sq.sync();
+                    self.submitted_tasks[self.op_counter as usize] = Some(task);
+                    self.completions_array[self.op_counter as usize] = 1;
+                    self.op_counter = self.op_counter.wrapping_add(1);
                 }
-                sq.sync();
+                self.ring.submit().expect("Failed to submit");
+                
                 self.inflight_requests += 1;
-
-                self.submitted_tasks[self.op_counter as usize] = Some(task);
-                self.completions_array[self.op_counter as usize] = 1;
-                self.op_counter = self.op_counter.wrapping_add(1);       
             }
 
             self.poll_completions();
