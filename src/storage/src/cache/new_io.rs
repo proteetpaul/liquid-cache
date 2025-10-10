@@ -23,6 +23,8 @@ pub trait IoTask: Send + Sync {
             waker.wake();
         }
     }
+
+    fn debug_print(&self);
 }
 
 #[allow(unused)]
@@ -77,6 +79,10 @@ impl IoTask for FileReadTask {
     fn completed(&self) -> &AtomicBool {
         &self.completed
     }
+    
+    fn debug_print(&self) {
+        println!("Read op, range: ({}, {})", self.range.start, self.range.end);
+    }
 }
 
 unsafe impl Send for FileReadTask {}
@@ -126,6 +132,10 @@ impl IoTask for FileWriteTask {
     #[inline]
     fn completed(&self) -> &AtomicBool {
         &self.completed
+    }
+    
+    fn debug_print(&self) {
+        println!("Write op, num bytes: {}", self.num_bytes);
     }
 }
 
@@ -247,11 +257,16 @@ impl UringWorker {
                     self.inflight_requests -= 1;
                     let errno = -cqe.result();
                     let err = std::io::Error::from_raw_os_error(errno);
-                    assert!(
-                        cqe.result() > 0,
-                        "Read cqe result error: {err}"
-                    );
                     let opcode = (cqe.user_data()>>48) as usize;
+                    if cqe.result() < 0 {
+                        self.submitted_tasks[opcode].as_ref().unwrap().debug_print();
+                        panic!("Cqe indicates IO error: {}", err);
+                    }
+                    // assert!(
+                    //     cqe.result() > 0,
+                    //     "Read cqe result error: {err}"
+                    // );
+                    
                     let remaining = &mut self.completions_array[opcode];
                     *remaining -= 1;
                     if *remaining == 0 {
