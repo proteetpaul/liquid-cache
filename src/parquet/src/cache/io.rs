@@ -142,12 +142,20 @@ pub(crate) fn blocking_reading_io(request: &IoRequest) -> Result<Bytes, std::io:
 
 #[cfg(target_os = "linux")]
 pub(crate) async fn non_blocking_reading_io(request: &IoRequest) -> Result<Bytes, std::io::Error> {
-    use std::{alloc::Layout, fs::OpenOptions, ops::Range, os::{fd::AsRawFd, unix::fs::OpenOptionsExt as _}};
+    use std::{fs::OpenOptions, ops::Range, os::{fd::AsRawFd, unix::fs::OpenOptionsExt as _}};
+
+    use liquid_cache_storage::cache::new_io::{get_io_mode, IoMode};
+
     use super::super::storage::cache::new_io::{FileReadTask, UringFuture};
 
     let path = &request.path();
+    let flags = if get_io_mode() == IoMode::Direct {
+        libc::O_DIRECT
+    } else {
+        0
+    };
     let file = OpenOptions::new().read(true)
-                .custom_flags(libc::O_DIRECT)
+                .custom_flags(flags)
                 .open(path)
                 .expect("failed to create file");
     
@@ -157,22 +165,15 @@ pub(crate) async fn non_blocking_reading_io(request: &IoRequest) -> Result<Bytes
             Range::<u64> {start: 0, end: file.metadata()?.len()}
         },
     };
-    let num_bytes = (range.end - range.start) as usize;
-    let layout = Layout::from_size_align(num_bytes, 4096)
-        .expect("Failed to create memory layout for disk read result");
-    let base_ptr = unsafe { std::alloc::alloc(layout) };
     let task = Arc::new(
         FileReadTask::new(
-            base_ptr, range, file.as_raw_fd()
+            range, file.as_raw_fd()
         )
     );
     let uring_fut = UringFuture::new(task.clone());
     uring_fut.await;
 
-    let buf = unsafe {
-        std::slice::from_raw_parts(task.as_ref().ptr(), num_bytes)
-    };
-    Ok(Bytes::from(buf))
+    Ok(task.get_bytes())
 }
 
 /// Resolve a sans-IO operation by repeatedly fulfilling IO requests until ready.

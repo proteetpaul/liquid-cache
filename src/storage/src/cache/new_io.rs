@@ -1,7 +1,10 @@
 #![allow(missing_docs)]
-use std::{ops::Range, os::fd::RawFd, pin::Pin, sync::{atomic::{AtomicBool, Ordering}, Arc, LazyLock, Mutex}, task::{Context, Poll, Waker}, thread};
+use std::{alloc::Layout, fmt::Display, ops::Range, os::fd::RawFd, pin::Pin, str::FromStr, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, OnceLock}, task::{Context, Poll, Waker}, thread};
 
+use bytes::Bytes;
 use io_uring::{cqueue, opcode, squeue, IoUring};
+
+const BLOCK_ALIGN: usize = 4096;
 
 pub trait IoTask: Send + Sync {
     #[inline]
@@ -16,6 +19,7 @@ pub trait IoTask: Send + Sync {
 
     fn completed(&self) -> &AtomicBool;
 
+    #[inline]
     fn notify_waker(&self) {
         self.completed().store(true, Ordering::Relaxed);
         let mut guard = self.waker().lock().unwrap();
@@ -34,18 +38,46 @@ pub struct FileReadTask {
     completed: AtomicBool,
     waker: Mutex<Option<Waker>>,
     range: Range<u64>,
+    start_padding: usize,
+    end_padding: usize,
 }
 
 impl FileReadTask {
     #[allow(unused)]
-    pub fn new(base_ptr: *mut u8, range: Range<u64>, fd: RawFd) -> FileReadTask {
-        return FileReadTask {base_ptr, fd, completed: AtomicBool::new(false), waker: Mutex::<Option<Waker>>::new(None), range: range}
+    pub fn new(range: Range<u64>, fd: RawFd) -> FileReadTask {
+        let mut start_padding: usize = 0;
+        let mut end_padding: usize = 0;
+        if get_io_mode() == IoMode::Direct {
+            // Padding must be applied to ensure that starting and ending addresses are block-aligned
+            start_padding = range.start as usize & (BLOCK_ALIGN - 1);
+            end_padding = if range.end as usize & (BLOCK_ALIGN - 1) == 0 {
+                0
+            } else {
+                BLOCK_ALIGN - (range.end as usize & (BLOCK_ALIGN - 1))
+            };
+        }
+        let layout = Layout::from_size_align((range.end - range.start) as usize + start_padding + end_padding, 4096)
+            .expect("Failed to create memory layout for disk read result");
+        let base_ptr = unsafe { std::alloc::alloc(layout) };
+        return FileReadTask {base_ptr, fd, completed: AtomicBool::new(false), waker: Mutex::<Option<Waker>>::new(None), range, start_padding, end_padding}
     }
 
     #[inline]
     pub fn ptr(&self) -> *const u8 {
         self.base_ptr as *const u8
     }
+
+    #[inline]
+    pub fn get_bytes(&self) -> Bytes {
+        let total_bytes = (self.range.end - self.range.start) as usize + self.start_padding + self.end_padding;
+        // println!("Total bytes: {}", total_bytes);
+        // println!("End offset: {}", self.range.end as usize - self.range.start as usize + self.start_padding);
+        unsafe {
+            let whole_slice = std::slice::from_raw_parts(self.base_ptr, total_bytes);
+            // The below slice operation removes the padding. This is a no-op in case of buffered IO
+            Bytes::from(whole_slice).slice(self.start_padding as usize..(self.range.end as usize - self.range.start as usize + self.start_padding))
+        }
+    } 
 }
 
 impl IoTask for FileReadTask {
@@ -56,20 +88,15 @@ impl IoTask for FileReadTask {
     
     #[inline]
     fn get_sqe(&self, user_data: u64) -> squeue::Entry {
-        let num_bytes = self.range.end - self.range.start;
-        let padding = if num_bytes % 4096 == 0 {
-            0
-        } else {
-            4096 - num_bytes % 4096
-        };
-        let num_bytes_aligned = num_bytes + padding;
+        let num_bytes = (self.range.end - self.range.start) as usize;
+        let num_bytes_aligned = num_bytes + self.start_padding + self.end_padding;
         let read_op = opcode::Read::new(
             io_uring::types::Fd(self.fd),
             self.base_ptr,
-            num_bytes_aligned as u32, // Logically, this should be the remaining number of bytes, but that fails...
+            num_bytes_aligned as u32,
         );
         let sqe = read_op
-            .offset(self.range.start)
+            .offset(self.range.start - self.start_padding as u64)
             .build()
             .user_data(user_data as u64);
         sqe
@@ -81,7 +108,7 @@ impl IoTask for FileReadTask {
     }
     
     fn debug_print(&self) {
-        println!("Read op, range: ({}, {})", self.range.start, self.range.end);
+        println!("Read op, range: ({}, {}), start_padding: {}, end_padding: {}", self.range.start, self.range.end, self.start_padding, self.end_padding);
     }
 }
 
@@ -91,6 +118,7 @@ unsafe impl Sync for FileReadTask {}
 pub struct FileWriteTask {
     base_ptr: *const u8,
     num_bytes: usize,
+    padding: usize,
     fd: RawFd,
     completed: AtomicBool,
     waker: Mutex<Option<Waker>>,
@@ -98,7 +126,11 @@ pub struct FileWriteTask {
 
 impl FileWriteTask {
     pub(crate) fn new(base_ptr: *const u8, num_bytes: usize, fd: RawFd) -> FileWriteTask {
-        return FileWriteTask {base_ptr, num_bytes, fd, completed: AtomicBool::new(false), waker: Mutex::<Option<Waker>>::new(None)}
+        let mut padding = 0;
+        if get_io_mode() == IoMode::Direct && (num_bytes & 4095) > 0 {
+            padding = 4096 - num_bytes % 4096;
+        }
+        return FileWriteTask {base_ptr, num_bytes, padding, fd, completed: AtomicBool::new(false), waker: Mutex::<Option<Waker>>::new(None)}
     }
 }
 
@@ -110,12 +142,7 @@ impl IoTask for FileWriteTask {
     
     #[inline]
     fn get_sqe(&self, user_data: u64) -> squeue::Entry {
-        let padding = if self.num_bytes % 4096 == 0 {
-            0
-        } else {
-            4096 - self.num_bytes % 4096
-        };
-        let num_bytes_aligned = self.num_bytes + padding;
+        let num_bytes_aligned = self.num_bytes + self.padding;
         let write_op = opcode::Write::new(
             io_uring::types::Fd(self.fd),
             self.base_ptr,
@@ -144,23 +171,79 @@ unsafe impl Sync for FileWriteTask {}
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum IoMode {
+    Direct,
+    Buffered,
+}
+
+impl Default for IoMode {
+    fn default() -> Self {
+        IoMode::Buffered
+    }
+}
+
+impl Display for IoMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                IoMode::Buffered => "buffered",
+                IoMode::Direct => "direct",
+            }
+        )
+    }
+}
+
+impl FromStr for IoMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "direct" => IoMode::Direct,
+            "buffered" => IoMode::Buffered,
+            _ => return Err(format!("Invalid IO mode: {s}")),
+        })
+    }
+}
+
 pub struct IoUringThreadpool {
     sender: crossbeam_channel::Sender<Arc<dyn IoTask>>,
     worker: Option<thread::JoinHandle<()>>,
+    io_type: IoMode,
 }
 
 unsafe impl Sync for IoUringThreadpool {}
 
-pub(crate) static IO_URING_THREAD_POOL_INST: LazyLock<IoUringThreadpool> = LazyLock::new(|| IoUringThreadpool::new());
+pub(crate) static IO_URING_THREAD_POOL_INST: OnceLock<IoUringThreadpool> = OnceLock::new();
+
+/**
+ * Intializes the global io-uring threadpool. This function must be called before submitting any IO to the pool.
+ */
+pub fn initialize_uring_pool(io_mode: IoMode) {
+    IO_URING_THREAD_POOL_INST.set(IoUringThreadpool::new(io_mode)).expect("Unable to initialize uring thread pool");
+}
+
+#[inline]
+pub fn get_io_mode() -> IoMode {
+    IO_URING_THREAD_POOL_INST.get().expect("Uring threadpool not initialized").io_mode()
+}
 
 impl IoUringThreadpool {
     const NUM_ENTRIES: u32 = 64;
 
-    fn new() -> IoUringThreadpool {        
+    pub fn new(io_type: IoMode) -> IoUringThreadpool {        
         let (sender, receiver) = crossbeam_channel::unbounded::<Arc<dyn IoTask>>();
 
         let mut builder = IoUring::<squeue::Entry, cqueue::Entry>::builder();
-        builder.setup_iopoll();
+        if io_type == IoMode::Direct {
+            println!("Using direct io");
+            // Polled IO is only supported for direct IO requests 
+            builder.setup_iopoll();
+        } else {
+            println!("Using buffered io");
+        }
         // Add a similar argument to the worker thread as well to sleep when not busy
         builder.setup_sqpoll(50000);
         let ring = builder
@@ -176,13 +259,19 @@ impl IoUringThreadpool {
         IoUringThreadpool {
             sender: sender,
             worker: Some(worker),
+            io_type,
         }
     }
 
-    pub(crate) fn submit_task(self: &Self, task: Arc<dyn IoTask>) {
+    #[inline]
+    pub fn submit_task(self: &Self, task: Arc<dyn IoTask>) {
         self.sender.send(task.clone()).expect("Failed to submit task through channel");
     }
 
+    #[inline]
+    pub fn io_mode(self: &Self) -> IoMode {
+        self.io_type.clone()
+    }
 }
 
 impl Drop for IoUringThreadpool {
@@ -192,6 +281,14 @@ impl Drop for IoUringThreadpool {
         if worker.is_some() {
             let _ = worker.unwrap().join();
         }
+    }
+}
+
+impl std::fmt::Debug for IoUringThreadpool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IoUringThreadpool")
+            .field("io_type", &self.io_type)
+            .finish()
     }
 }
 
@@ -259,13 +356,10 @@ impl UringWorker {
                     let err = std::io::Error::from_raw_os_error(errno);
                     let opcode = (cqe.user_data()>>48) as usize;
                     if cqe.result() < 0 {
+                        // TODO(): Send an error to the requestor
                         self.submitted_tasks[opcode].as_ref().unwrap().debug_print();
                         panic!("Cqe indicates IO error: {}", err);
                     }
-                    // assert!(
-                    //     cqe.result() > 0,
-                    //     "Read cqe result error: {err}"
-                    // );
                     
                     let remaining = &mut self.completions_array[opcode];
                     *remaining -= 1;
@@ -306,8 +400,8 @@ impl<T> Future for UringFuture<T>
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         match self.state {
             UringState::Initialized => {
-                // Measure the io latency
-                IO_URING_THREAD_POOL_INST.submit_task(self.task.clone());
+                let pool = IO_URING_THREAD_POOL_INST.get().expect("Uring threadpool not initialized");
+                pool.submit_task(self.task.clone());
                 self.task.set_waker(cx.waker().clone());
                 self.state = UringState::Submitted;
                 return Poll::Pending;

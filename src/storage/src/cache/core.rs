@@ -442,8 +442,6 @@ impl CacheStorage {
         io_worker: Arc<dyn IoContext>,
     ) -> Self {
         let config = CacheConfig::new(batch_size, max_cache_bytes, cache_dir);
-        #[cfg(target_os = "linux")]
-        // let io_pool = IoUringPool::new(DEFAULT_RING_ENTRIES);
         Self {
             index: ArtIndex::new(),
             budget: BudgetAccounting::new(config.max_cache_bytes()),
@@ -595,10 +593,15 @@ impl CacheStorage {
         {
             use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt as _};
             use std::os::fd::AsRawFd;
-            use crate::cache::new_io::FileWriteTask;
+            use crate::cache::new_io::{get_io_mode, FileWriteTask, IoMode};
 
+            let flags = if get_io_mode() == IoMode::Direct {
+                libc::O_DIRECT
+            } else {
+                0
+            };
             let file = OpenOptions::new().create(true).write(true)
-                .custom_flags(libc::O_DIRECT)
+                .custom_flags(flags)
                 .open(path)
                 .expect("failed to create file");
             let task = Arc::new(

@@ -3,7 +3,7 @@ use clap::Parser;
 use fastrace_tonic::FastraceServerLayer;
 use liquid_cache_benchmarks::{BenchmarkMode, setup_observability};
 use liquid_cache_server::{LiquidCacheService, run_admin_server};
-use liquid_cache_storage::cache_policies::LiquidPolicy;
+use liquid_cache_storage::{cache::new_io::IoMode, cache_policies::LiquidPolicy};
 use log::info;
 use mimalloc::MiMalloc;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
@@ -46,6 +46,10 @@ struct CliArgs {
     /// Openobserve auth token
     #[arg(long)]
     openobserve_auth: Option<String>,
+
+    /// IO mode (direct vs buffered)
+    #[arg(long = "io-mode", default_value = "buffered")]
+    io_mode: IoMode,
 }
 
 #[tokio::main]
@@ -78,6 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.disk_cache_dir.clone(),
         Box::new(LiquidPolicy::new()),
         squeeze_policy,
+        Some(IoMode::Direct),
     )?;
 
     let liquid_cache_server = Arc::new(liquid_cache_server);
