@@ -73,9 +73,11 @@ impl FileReadTask {
         // println!("Total bytes: {}", total_bytes);
         // println!("End offset: {}", self.range.end as usize - self.range.start as usize + self.start_padding);
         unsafe {
-            let whole_slice = std::slice::from_raw_parts(self.base_ptr, total_bytes);
+            // let whole_slice = std::slice::from_raw_parts(self.base_ptr, total_bytes);
+            let vec = Vec::from_raw_parts(self.base_ptr, total_bytes, total_bytes);
+            let owned_slice: Box<[u8]> = vec.into_boxed_slice();
             // The below slice operation removes the padding. This is a no-op in case of buffered IO
-            Bytes::from(whole_slice).slice(self.start_padding as usize..(self.range.end as usize - self.range.start as usize + self.start_padding))
+            Bytes::from(owned_slice).slice(self.start_padding as usize..(self.range.end as usize - self.range.start as usize + self.start_padding))
         }
     } 
 }
