@@ -70,10 +70,7 @@ impl FileReadTask {
     #[inline]
     pub fn get_bytes(&self) -> Bytes {
         let total_bytes = (self.range.end - self.range.start) as usize + self.start_padding + self.end_padding;
-        // println!("Total bytes: {}", total_bytes);
-        // println!("End offset: {}", self.range.end as usize - self.range.start as usize + self.start_padding);
         unsafe {
-            // let whole_slice = std::slice::from_raw_parts(self.base_ptr, total_bytes);
             let vec = Vec::from_raw_parts(self.base_ptr, total_bytes, total_bytes);
             let owned_slice: Box<[u8]> = vec.into_boxed_slice();
             // The below slice operation removes the padding. This is a no-op in case of buffered IO

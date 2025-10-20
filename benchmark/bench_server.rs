@@ -82,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.disk_cache_dir.clone(),
         Box::new(LiquidPolicy::new()),
         squeeze_policy,
-        Some(IoMode::Direct),
+        Some(args.io_mode),
     )?;
 
     let liquid_cache_server = Arc::new(liquid_cache_server);
