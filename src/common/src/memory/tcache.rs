@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     ptr::null_mut,
     sync::{Arc, Mutex},
 };
@@ -449,5 +450,263 @@ impl TCache {
     #[allow(unused)]
     pub(crate) fn get_stats(self: &Self) -> TCacheStats {
         self.stats.clone()
+    }
+
+    /// Collect memory usage and fragmentation statistics for this thread-local cache
+    pub(crate) fn collect_memory_stats(self: &Self) -> (usize, usize, usize, usize, usize, HashSet<usize>) {
+        let mut total_allocated_memory = 0usize;
+        let mut total_used_memory = 0usize;
+        let mut total_internal_fragmentation = 0usize;
+        let mut total_free_in_spans = 0usize;
+        let mut pages_count = 0usize;
+        let mut segments_tracked = HashSet::<usize>::new();
+
+        // First, collect all segments that are referenced in free_pages, used_pages, or spans
+        for size_class in 0..NUM_SIZE_CLASSES {
+            let page = self.free_pages[size_class];
+            if page != null_mut() {
+                unsafe {
+                    let segment_ptr = Segment::get_segment_from_ptr(page as *mut u8);
+                    segments_tracked.insert(segment_ptr as usize);
+                }
+            }
+        }
+
+        for size_class in 0..=NUM_SIZE_CLASSES {
+            for page_ptr in &self.used_pages[size_class] {
+                unsafe {
+                    let segment_ptr = Segment::get_segment_from_ptr(*page_ptr as *mut u8);
+                    segments_tracked.insert(segment_ptr as usize);
+                }
+            }
+        }
+
+        for bin_idx in 0..SEGMENT_BINS {
+            let mut slice_ptr = self.spans[bin_idx].first;
+            while slice_ptr != null_mut() {
+                unsafe {
+                    let segment_ptr = Segment::get_segment_from_ptr(slice_ptr as *mut u8);
+                    segments_tracked.insert(segment_ptr as usize);
+                    slice_ptr = (*slice_ptr).next_page;
+                }
+            }
+        }
+
+        // Build a set of slices that are in spans (to avoid double-counting)
+        let mut slices_in_spans = HashSet::<usize>::new();
+        for bin_idx in 0..SEGMENT_BINS {
+            let mut slice_ptr = self.spans[bin_idx].first;
+            while slice_ptr != null_mut() {
+                unsafe {
+                    slices_in_spans.insert(slice_ptr as usize);
+                    let slice_ref = &*slice_ptr;
+                    let slice_memory = slice_ref.slice_count * PAGE_SIZE;
+                    total_free_in_spans += slice_memory;
+                    slice_ptr = slice_ref.next_page;
+                }
+            }
+        }
+
+        // Now iterate through ALL slices in ALL tracked segments
+        for segment_ptr_usize in &segments_tracked {
+            unsafe {
+                let segment_ptr = *segment_ptr_usize as *mut Segment;
+                let segment_ref = &*segment_ptr;
+                
+                // Iterate through all slices in this segment
+                let mut slice_idx = 0usize;
+                while slice_idx < PAGES_PER_SEGMENT {
+                    let slice_page = &segment_ref.pages[slice_idx];
+                    let slice_memory = slice_page.slice_count * PAGE_SIZE;
+                    let slice_ptr = slice_page as *const Page as *mut Page;
+                    
+                    if slice_page.block_size > 0 {
+                        // Allocated slice - count its memory
+                        let used_memory = slice_page.used * slice_page.block_size;
+                        let fragmentation = slice_memory - used_memory;
+                        
+                        total_allocated_memory += slice_memory;
+                        total_used_memory += used_memory;
+                        total_internal_fragmentation += fragmentation;
+                        pages_count += 1;
+                    } else {
+                        // Free slice - check if it's in spans
+                        if !slices_in_spans.contains(&(slice_ptr as usize)) {
+                            // Free slice not in spans - this is unaccounted memory!
+                            // This indicates a potential bug or intermediate state
+                            total_free_in_spans += slice_memory;
+                        }
+                        // If it's in spans, we already counted it above
+                    }
+                    
+                    slice_idx += slice_page.slice_count;
+                }
+            }
+        }
+
+        (total_allocated_memory, total_used_memory, total_internal_fragmentation, total_free_in_spans, pages_count, segments_tracked)
+    }
+
+    /// Print detailed memory usage and fragmentation statistics for this thread-local cache
+    pub(crate) fn print_memory_stats(self: &Self) {
+        let mut total_allocated_memory = 0usize;
+        let mut total_used_memory = 0usize;
+        let mut total_internal_fragmentation = 0usize;
+        let mut total_free_in_spans = 0usize;
+        let mut pages_count = 0usize;
+        let mut segments_tracked = HashSet::<usize>::new();
+
+        // Track memory in free_pages
+        log::info!("=== TCache Memory Stats (thread_id: {}) ===", self.thread_id);
+        log::info!("Free pages:");
+        for size_class in 0..NUM_SIZE_CLASSES {
+            let page = self.free_pages[size_class];
+            if page != null_mut() {
+                unsafe {
+                    let page_ref = &*page;
+                    let page_memory = page_ref.slice_count * PAGE_SIZE;
+                    let block_size = page_ref.block_size;
+                    let used_blocks = page_ref.used;
+                    let used_memory = used_blocks * block_size;
+                    let fragmentation = page_memory - used_memory;
+                    
+                    total_allocated_memory += page_memory;
+                    total_used_memory += used_memory;
+                    total_internal_fragmentation += fragmentation;
+                    pages_count += 1;
+
+                    let segment_ptr = Segment::get_segment_from_ptr(page as *mut u8);
+                    segments_tracked.insert(segment_ptr as usize);
+
+                    log::info!("  Size class {} ({} KB): 1 page, {} KB allocated, {} KB used ({} blocks), {} KB fragmentation ({:.1}%)",
+                        size_class,
+                        SIZE_CLASSES[size_class] / 1024,
+                        page_memory / 1024,
+                        used_memory / 1024,
+                        used_blocks,
+                        fragmentation / 1024,
+                        (fragmentation as f64 / page_memory as f64) * 100.0
+                    );
+                }
+            }
+        }
+
+        // Track memory in used_pages
+        log::info!("Used pages:");
+        for size_class in 0..=NUM_SIZE_CLASSES {
+            let size_class_name = if size_class < NUM_SIZE_CLASSES {
+                format!("{} KB", SIZE_CLASSES[size_class] / 1024)
+            } else {
+                "Large (>64 KB)".to_string()
+            };
+            
+            let mut size_class_allocated = 0usize;
+            let mut size_class_used = 0usize;
+            let mut size_class_fragmentation = 0usize;
+            let mut size_class_pages = 0usize;
+
+            for page_ptr in &self.used_pages[size_class] {
+                unsafe {
+                    let page_ref = &**page_ptr;
+                    let page_memory = page_ref.slice_count * PAGE_SIZE;
+                    let block_size = page_ref.block_size;
+                    let used_blocks = page_ref.used;
+                    let used_memory = used_blocks * block_size;
+                    let fragmentation = page_memory - used_memory;
+                    
+                    size_class_allocated += page_memory;
+                    size_class_used += used_memory;
+                    size_class_fragmentation += fragmentation;
+                    size_class_pages += 1;
+
+                    let segment_ptr = Segment::get_segment_from_ptr(*page_ptr as *mut u8);
+                    segments_tracked.insert(segment_ptr as usize);
+                }
+            }
+
+            if size_class_pages > 0 {
+                total_allocated_memory += size_class_allocated;
+                total_used_memory += size_class_used;
+                total_internal_fragmentation += size_class_fragmentation;
+                pages_count += size_class_pages;
+
+                log::info!("  Size class {}: {} pages, {} KB allocated, {} KB used, {} KB fragmentation ({:.1}%)",
+                    size_class_name,
+                    size_class_pages,
+                    size_class_allocated / 1024,
+                    size_class_used / 1024,
+                    size_class_fragmentation / 1024,
+                    if size_class_allocated > 0 {
+                        (size_class_fragmentation as f64 / size_class_allocated as f64) * 100.0
+                    } else {
+                        0.0
+                    }
+                );
+            }
+        }
+
+        // Track free memory in spans
+        log::info!("Free spans (unallocated slices):");
+        for bin_idx in 0..SEGMENT_BINS {
+            let mut span_allocated = 0usize;
+            let mut span_slices = 0usize;
+            let mut slice_ptr = self.spans[bin_idx].first;
+            
+            while slice_ptr != null_mut() {
+                unsafe {
+                    let slice_ref = &*slice_ptr;
+                    let slice_memory = slice_ref.slice_count * PAGE_SIZE;
+                    span_allocated += slice_memory;
+                    span_slices += 1;
+                    
+                    let segment_ptr = Segment::get_segment_from_ptr(slice_ptr as *mut u8);
+                    segments_tracked.insert(segment_ptr as usize);
+                    
+                    slice_ptr = slice_ref.next_page;
+                }
+            }
+
+            if span_slices > 0 {
+                total_free_in_spans += span_allocated;
+                log::info!("  Bin {} (2^{} pages): {} slices, {} KB free",
+                    bin_idx,
+                    bin_idx,
+                    span_slices,
+                    span_allocated / 1024
+                );
+            }
+        }
+
+        // Calculate total segment memory owned by this cache
+        let total_segment_memory = segments_tracked.len() * SEGMENT_SIZE;
+
+        // Summary
+        log::info!("=== Summary ===");
+        log::info!("Total pages tracked: {}", pages_count);
+        log::info!("Total segments owned: {} ({} MB)", segments_tracked.len(), (segments_tracked.len() * SEGMENT_SIZE) / (1024 * 1024));
+        log::info!("Memory in allocated pages: {} KB ({:.2} MB)", total_allocated_memory / 1024, total_allocated_memory as f64 / (1024.0 * 1024.0));
+        log::info!("Memory actually used: {} KB ({:.2} MB)", total_used_memory / 1024, total_used_memory as f64 / (1024.0 * 1024.0));
+        log::info!("Internal fragmentation: {} KB ({:.2} MB, {:.1}%)",
+            total_internal_fragmentation / 1024,
+            total_internal_fragmentation as f64 / (1024.0 * 1024.0),
+            if total_allocated_memory > 0 {
+                (total_internal_fragmentation as f64 / total_allocated_memory as f64) * 100.0
+            } else {
+                0.0
+            }
+        );
+        log::info!("Free memory in spans: {} KB ({:.2} MB)", total_free_in_spans / 1024, total_free_in_spans as f64 / (1024.0 * 1024.0));
+        log::info!("Total memory managed by cache: {} KB ({:.2} MB)",
+            total_segment_memory / 1024,
+            total_segment_memory as f64 / (1024.0 * 1024.0)
+        );
+        log::info!("Utilization: {:.1}% (used / total managed)",
+            if total_segment_memory > 0 {
+                (total_used_memory as f64 / total_segment_memory as f64) * 100.0
+            } else {
+                0.0
+            }
+        );
+        log::info!("================================");
     }
 }

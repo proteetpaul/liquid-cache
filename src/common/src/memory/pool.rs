@@ -1,7 +1,7 @@
 extern crate io_uring;
 
 use core::slice;
-use std::{cmp::min, sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, AtomicU64, Ordering}}};
+use std::{cmp::min, collections::HashSet, sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, AtomicU64, Ordering}}};
 
 use futures::io;
 use io_uring::IoUring;
@@ -194,6 +194,104 @@ impl FixedBufferPool {
             agg_stats.total_allocations += stats.total_allocations;
         }
         agg_stats.print();
+    }
+
+    /// Print detailed memory usage and fragmentation statistics for a specific CPU's cache
+    pub fn print_memory_stats(cpu: usize) {
+        if FIXED_BUFFER_POOL.get().is_none() {
+            log::warn!("Buffer pool not initialized");
+            return;
+        }
+        let pool = FIXED_BUFFER_POOL.get().unwrap();
+        let num_cpus = std::thread::available_parallelism().unwrap();
+        if cpu >= num_cpus.get() {
+            log::warn!("Invalid CPU index: {} (max: {})", cpu, num_cpus.get() - 1);
+            return;
+        }
+        let tcache = pool.local_caches[cpu].lock().unwrap();
+        tcache.print_memory_stats();
+    }
+
+    /// Print aggregated memory usage and fragmentation statistics across all CPU caches
+    pub fn print_current_memory_stats() {
+        if FIXED_BUFFER_POOL.get().is_none() {
+            log::warn!("Buffer pool not initialized");
+            return;
+        }
+        let pool = FIXED_BUFFER_POOL.get().unwrap();
+        let num_cpus = std::thread::available_parallelism().unwrap();
+        
+        // Aggregate stats across all caches
+        let mut total_allocated_memory = 0usize;
+        let mut total_used_memory = 0usize;
+        let mut total_internal_fragmentation = 0usize;
+        let mut total_free_in_spans = 0usize;
+        let mut total_pages_count = 0usize;
+        let mut all_segments = HashSet::<usize>::new();
+        
+        for cpu in 0..num_cpus.get() {
+            let tcache = pool.local_caches[cpu].lock().unwrap();
+            let (allocated, used, fragmentation, free_spans, pages, segments) = tcache.collect_memory_stats();
+            
+            total_allocated_memory += allocated;
+            total_used_memory += used;
+            total_internal_fragmentation += fragmentation;
+            total_free_in_spans += free_spans;
+            total_pages_count += pages;
+            all_segments.extend(segments);
+        }
+        
+        let total_segment_memory = all_segments.len() * crate::memory::segment::SEGMENT_SIZE;
+        
+        // Print aggregated summary
+        log::info!("=== Aggregated Memory Stats (All {} CPUs) ===", num_cpus.get());
+        log::info!("Total pages tracked: {}", total_pages_count);
+        log::info!("Total segments owned: {} ({} MB)", all_segments.len(), (all_segments.len() * crate::memory::segment::SEGMENT_SIZE) / (1024 * 1024));
+        log::info!("Memory in allocated pages: {} KB ({:.2} MB)", total_allocated_memory / 1024, total_allocated_memory as f64 / (1024.0 * 1024.0));
+        log::info!("Memory actually used: {} KB ({:.2} MB)", total_used_memory / 1024, total_used_memory as f64 / (1024.0 * 1024.0));
+        log::info!("Internal fragmentation: {} KB ({:.2} MB, {:.1}%)",
+            total_internal_fragmentation / 1024,
+            total_internal_fragmentation as f64 / (1024.0 * 1024.0),
+            if total_allocated_memory > 0 {
+                (total_internal_fragmentation as f64 / total_allocated_memory as f64) * 100.0
+            } else {
+                0.0
+            }
+        );
+        log::info!("Free memory in spans: {} KB ({:.2} MB)", total_free_in_spans / 1024, total_free_in_spans as f64 / (1024.0 * 1024.0));
+        log::info!("Total memory managed by all caches: {} KB ({:.2} MB)",
+            total_segment_memory / 1024,
+            total_segment_memory as f64 / (1024.0 * 1024.0)
+        );
+        
+        // Calculate unaccounted memory (segments - allocated - free)
+        let accounted_memory = total_allocated_memory + total_free_in_spans;
+        let unaccounted_memory = if total_segment_memory > accounted_memory {
+            total_segment_memory - accounted_memory
+        } else {
+            0
+        };
+        
+        if unaccounted_memory > 0 {
+            log::info!("⚠️  Unaccounted memory: {} KB ({:.2} MB, {:.1}%) - This may indicate pages not tracked in free_pages/used_pages/spans",
+                unaccounted_memory / 1024,
+                unaccounted_memory as f64 / (1024.0 * 1024.0),
+                if total_segment_memory > 0 {
+                    (unaccounted_memory as f64 / total_segment_memory as f64) * 100.0
+                } else {
+                    0.0
+                }
+            );
+        }
+        
+        log::info!("Utilization: {:.1}% (used / total managed)",
+            if total_segment_memory > 0 {
+                (total_used_memory as f64 / total_segment_memory as f64) * 100.0
+            } else {
+                0.0
+            }
+        );
+        log::info!("================================");
     }
 }
 

@@ -2,7 +2,7 @@ use std::ptr::{null_mut, write};
 
 use crate::memory::{page::{PAGE_SIZE, Page, Slice}};
 
-pub const SEGMENT_SIZE: usize = 32 * 1024 * 1024;       // 32 MB
+pub const SEGMENT_SIZE: usize = 16 * 1024 * 1024;       // 32 MB
 pub const SEGMENT_SIZE_BITS: usize = SEGMENT_SIZE.ilog2() as usize;
 
 // The metadata is stored at the beginning of the slice. So we don't get the entirety of it for pages

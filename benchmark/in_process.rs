@@ -101,6 +101,7 @@ async fn main() -> Result<()> {
     let _guard = root.set_local_parent();
 
     benchmark.run().await?;
+    FixedBufferPool::print_current_memory_stats();
     FixedBufferPool::print_stats();
     fastrace::flush();
     Ok(())
