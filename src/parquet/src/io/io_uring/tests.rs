@@ -1,5 +1,8 @@
 #![cfg(target_os = "linux")]
 
+use crate::io::io_uring::local_runtime::{self, UringExecutor};
+use crate::io::io_uring::work_stealing::{self, WorkStealingUringRuntime};
+
 use super::{
     initialize_uring_pool, multi_async_uring, multi_blocking_uring, single_uring, thread_pool_uring,
 };
@@ -55,7 +58,7 @@ impl BackendKind {
                     } else {
                         IoMode::Uring
                     };
-                    initialize_uring_pool(mode);
+                    initialize_uring_pool(mode, false);
                 });
             }
             BackendKind::MultiBlocking => {
@@ -79,21 +82,25 @@ impl BackendKind {
             BackendKind::MultiBlocking => {
                 async move { multi_blocking_uring::read(path, range, direct_io) }.boxed()
             }
-            BackendKind::ThreadPool => thread_pool_uring::read(path, range, direct_io).boxed(),
+            BackendKind::ThreadPool => {
+                thread_pool_uring::read(path, range, direct_io, true).boxed()
+            }
         }
     }
 
     fn write_future(self, path: PathBuf, data: Bytes) -> IoFuture<()> {
         match self {
-            BackendKind::Shared => async move { single_uring::write(path, &data).await }.boxed(),
+            BackendKind::Shared => {
+                async move { single_uring::write(path, &data, false).await }.boxed()
+            }
             BackendKind::MultiAsync => {
-                async move { multi_async_uring::write(path, &data).await }.boxed()
+                async move { multi_async_uring::write(path, &data, false).await }.boxed()
             }
             BackendKind::MultiBlocking => {
-                async move { multi_blocking_uring::write(path, &data) }.boxed()
+                async move { multi_blocking_uring::write(path, &data, false) }.boxed()
             }
             BackendKind::ThreadPool => {
-                async move { thread_pool_uring::write(path, &data).await }.boxed()
+                async move { thread_pool_uring::write(path, &data, false, false).await }.boxed()
             }
         }
     }
@@ -149,4 +156,64 @@ fn read_write_roundtrip_all_backends() {
 
         drop(tmpdir);
     }
+}
+
+/// Work-stealing uring runtime
+#[test]
+fn read_write_roundtrip_work_stealing_uring() {
+    let original: Vec<u8> = (0..128).map(|i| (i as u8).wrapping_mul(3)).collect();
+    let runtime = WorkStealingUringRuntime::new(2);
+
+    let (tmpdir, path) = seed_file(&original);
+    let path_clone = path.clone();
+    let read_bytes = runtime
+        .run_to_completion(async move { work_stealing::read(path_clone, None).await })
+        .unwrap_or_else(|err| panic!("ws read failed: {err}"));
+    assert_eq!(
+        read_bytes.as_ref(),
+        original.as_slice(),
+        "ws read returned unexpected payload",
+    );
+
+    let new_payload: Vec<u8> = (0..64).map(|i| (i as u8).wrapping_add(7)).collect();
+    let bytes = Bytes::from(new_payload.clone());
+    let path_clone = path.clone();
+    runtime
+        .run_to_completion(async move { work_stealing::write(path_clone, &bytes).await })
+        .unwrap_or_else(|err| panic!("ws write failed: {err}"));
+
+    let on_disk = fs::read(&path).expect("failed to read updated file");
+    assert_eq!(on_disk, new_payload, "ws wrote unexpected data");
+
+    drop(tmpdir);
+}
+
+/// Non-blocking uring requires a dedicated runtime
+#[test]
+fn read_write_roundtrip_non_blocking_uring() {
+    let original: Vec<u8> = (0..128).map(|i| (i as u8).wrapping_mul(3)).collect();
+    let mut executor = UringExecutor::new(1);
+
+    let (tmpdir, path) = seed_file(&original);
+    let path_clone = path.clone();
+    let read_bytes = executor
+        .run_to_completion(async move { local_runtime::read(path_clone, None).await })
+        .unwrap_or_else(|err| panic!("read failed: {err}"));
+    assert_eq!(
+        read_bytes.as_ref(),
+        original.as_slice(),
+        "read returned unexpected payload",
+    );
+
+    let new_payload: Vec<u8> = (0..64).map(|i| (i as u8).wrapping_add(1)).collect();
+    let bytes = Bytes::from(new_payload.clone());
+    let path_clone = path.clone();
+    executor
+        .run_to_completion(async move { local_runtime::write(path_clone, &bytes.clone()).await })
+        .unwrap_or_else(|err| panic!("write failed: {err}"));
+
+    let on_disk = fs::read(&path).expect("failed to read updated file");
+    assert_eq!(on_disk, new_payload, "wrote unexpected data",);
+
+    drop(tmpdir);
 }
