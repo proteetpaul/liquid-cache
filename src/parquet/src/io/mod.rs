@@ -13,9 +13,9 @@ use liquid_cache_storage::cache::{CacheExpression, EntryID, IoContext, LiquidCom
 use crate::cache::{ColumnAccessPath, ParquetArrayID};
 
 #[cfg(target_os = "linux")]
-mod io_uring;
+pub mod io_uring;
 
-mod io_backend;
+pub mod io_backend;
 
 #[derive(Debug)]
 pub(crate) struct ParquetIoContext {
@@ -26,19 +26,25 @@ pub(crate) struct ParquetIoContext {
 }
 
 impl ParquetIoContext {
-    pub fn new(base_dir: PathBuf, io_mode: IoMode) -> Self {
+    pub fn new(base_dir: PathBuf, io_mode: IoMode, fixed_buffer_pool_size_mb: usize) -> Self {
         if matches!(
             io_mode,
-            IoMode::UringDirect | IoMode::Uring | IoMode::UringBlocking
+            IoMode::UringDirect | IoMode::Uring | IoMode::UringBlocking | IoMode::UringNonBlocking
         ) {
             #[cfg(target_os = "linux")]
             {
-                crate::io::io_uring::initialize_uring_pool(io_mode);
+                use liquid_cache_common::memory::pool::FixedBufferPool;
+                if fixed_buffer_pool_size_mb > 0 {
+                    FixedBufferPool::init(fixed_buffer_pool_size_mb);
+                }
+                crate::io::io_uring::initialize_uring_pool(io_mode, fixed_buffer_pool_size_mb > 0);
             }
             #[cfg(not(target_os = "linux"))]
             {
                 panic!("io_mode {:?} is only supported on Linux", io_mode);
             }
+        } else if fixed_buffer_pool_size_mb > 0 {
+            panic!("Fixed buffers are only supported for UringDirect, Uring and UringBlocking");
         }
 
         Self {
@@ -133,6 +139,87 @@ impl IoContext for ParquetIoContext {
     }
 }
 
+/// Simple [IoContext] with IO mode selection (tokio, blocking, io_uring, etc.).
+/// Uses simple EntryID-based paths and a single compressor, like storage's [liquid_cache_storage::cache::DefaultIoContext],
+/// but delegates read/write to [io_backend] so all [IoMode]s are supported.
+#[derive(Debug)]
+pub struct SimpleIoContext {
+    compressor_state: Arc<LiquidCompressorStates>,
+    squeeze_hints: RwLock<AHashMap<EntryID, Arc<CacheExpression>>>,
+    base_dir: PathBuf,
+    io_mode: IoMode,
+}
+
+impl SimpleIoContext {
+    /// Create a new [SimpleIoContext] with the given base directory and IO mode.
+    pub fn new(base_dir: PathBuf, io_mode: IoMode, fixed_buffer_pool_size_mb: usize) -> Self {
+        if matches!(
+            io_mode,
+            IoMode::UringDirect | IoMode::Uring | IoMode::UringBlocking | IoMode::UringNonBlocking
+        ) {
+            #[cfg(target_os = "linux")]
+            {
+                use liquid_cache_common::memory::pool::FixedBufferPool;
+                if fixed_buffer_pool_size_mb > 0 {
+                    FixedBufferPool::init(fixed_buffer_pool_size_mb);
+                }
+                crate::io::io_uring::initialize_uring_pool(io_mode, fixed_buffer_pool_size_mb > 0);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                panic!("io_mode {:?} is only supported on Linux", io_mode);
+            }
+        } else if fixed_buffer_pool_size_mb > 0 {
+            panic!("Fixed buffers are only supported for UringDirect, Uring and UringBlocking");
+        }
+
+        Self {
+            compressor_state: Arc::new(LiquidCompressorStates::new()),
+            squeeze_hints: RwLock::new(AHashMap::new()),
+            base_dir,
+            io_mode,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl IoContext for SimpleIoContext {
+    fn add_squeeze_hint(&self, entry_id: &EntryID, expression: Arc<CacheExpression>) {
+        let mut guard = self.squeeze_hints.write().unwrap();
+        guard.insert(*entry_id, expression);
+    }
+
+    fn squeeze_hint(&self, entry_id: &EntryID) -> Option<Arc<CacheExpression>> {
+        let guard = self.squeeze_hints.read().unwrap();
+        guard.get(entry_id).cloned()
+    }
+
+    fn get_compressor(&self, _entry_id: &EntryID) -> Arc<LiquidCompressorStates> {
+        self.compressor_state.clone()
+    }
+
+    fn disk_path(&self, entry_id: &EntryID) -> PathBuf {
+        self.base_dir
+            .join(format!("{:016x}.liquid", usize::from(*entry_id)))
+    }
+
+    #[inline(never)]
+    #[fastrace::trace]
+    async fn read(
+        &self,
+        path: PathBuf,
+        range: Option<Range<u64>>,
+    ) -> Result<Bytes, std::io::Error> {
+        io_backend::read(self.io_mode, path, range).await
+    }
+
+    #[inline(never)]
+    #[fastrace::trace]
+    async fn write_file(&self, path: PathBuf, data: Bytes) -> Result<(), std::io::Error> {
+        io_backend::write(self.io_mode, path, data).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,7 +234,7 @@ mod tests {
     #[test]
     fn squeeze_hint_tracks_majority() {
         let tmp = tempdir().unwrap();
-        let ctx = ParquetIoContext::new(tmp.path().to_path_buf(), IoMode::StdBlocking);
+        let ctx = ParquetIoContext::new(tmp.path().to_path_buf(), IoMode::StdBlocking, 0);
         let e = entry(1, 2, 3);
         let month = Arc::new(CacheExpression::extract_date32(Date32Field::Month));
         let year = Arc::new(CacheExpression::extract_date32(Date32Field::Year));
@@ -163,7 +250,7 @@ mod tests {
     #[test]
     fn squeeze_hint_prefers_recent_on_tie() {
         let tmp = tempdir().unwrap();
-        let ctx = ParquetIoContext::new(tmp.path().to_path_buf(), IoMode::StdBlocking);
+        let ctx = ParquetIoContext::new(tmp.path().to_path_buf(), IoMode::StdBlocking, 0);
         let e = entry(9, 9, 9);
         let year = Arc::new(CacheExpression::extract_date32(Date32Field::Year));
         let day = Arc::new(CacheExpression::extract_date32(Date32Field::Day));
